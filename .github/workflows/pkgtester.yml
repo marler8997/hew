@@ -1,0 +1,76 @@
+name: Package Tester
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'The package to test'
+        required: true
+        type: string
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Windows builds
+          - os: windows-latest
+            arch: aarch64
+          - os: windows-latest
+            arch: x86
+          - os: windows-latest
+            arch: x86_64
+          # macOS builds
+          - os: macos-latest
+            arch: aarch64
+          - os: macos-latest
+            arch: x86_64
+          # Linux builds
+          - os: ubuntu-latest
+            arch: aarch64
+          - os: ubuntu-latest
+            arch: armv7a
+          - os: ubuntu-latest
+            arch: powerpc64le
+          - os: ubuntu-latest
+            arch: riscv64
+          - os: ubuntu-latest
+            arch: s390x
+          - os: ubuntu-latest
+            arch: x86
+          - os: ubuntu-latest
+            arch: x86_64
+      fail-fast: false
+    runs-on: ${{matrix.os}}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+      - name: Build hew
+        run: zig build
+
+      # --------------------------------------------------------------------------------
+      # Windows
+      # --------------------------------------------------------------------------------
+      - name: Configure bin path (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $env:PATH = "$env:PATH;${{ github.workspace }}\test\bin"
+          .\zig-out\bin\hew.exe new-bin-path --app-data ${{ github.workspace }}\test\appdata ${{ github.workspace }}\test\bin
+      - name: Install package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $env:PATH = "$env:PATH;${{ github.workspace }}\test\bin"
+          .\zig-out\bin\hew.exe install --app-data ${{ github.workspace }}\test\appdata --non-interactive --allow-shadow ${{ github.event.inputs.package }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # --------------------------------------------------------------------------------
+      # Not Windows
+      # --------------------------------------------------------------------------------
+      - name: Configure bin path (Posix)
+        if: runner.os != 'Windows'
+        run: PATH="$PATH:${{ github.workspace }}/test/bin" ./zig-out/bin/hew new-bin-path --app-data ${{ github.workspace }}/test/appdata ${{ github.workspace }}/test/bin
+      - name: Install package (Posix)
+        if: runner.os != 'Windows'
+        run: PATH="$PATH:${{ github.workspace }}/test/bin" ./zig-out/bin/hew install --app-data ${{ github.workspace }}/test/appdata --non-interactive --allow-shadow ${{ github.event.inputs.package }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,15 @@
+.{
+    .name = .hew,
+    .fingerprint = 0x6f6e38f761c1afa2,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // used on the CI for create zip files on windows
+        .zipcmdline = .{
+            .url = "git+https://github.com/marler8997/zipcmdline#a8807944231b46565450504cb7f3146e29e51335",
+            .hash = "zipcmdline-0.0.0-DFii09hmAwAK1TuCE9eIMZANDZRJnodAHOUOCM8pAPO3",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
