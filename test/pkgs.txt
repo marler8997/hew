@@ -1,5 +1,4 @@
-# TODO: include hew itself after the first release
-# github:marler8997/hew,ref=TODO
+github:marler8997/hew
 github:marler8997/zipcmdline,ref=v2025_11_02
 github:marler8997/msi,ref=a8033245765dc3ec94cfe0d6f4f9d7725700c5b9
 # TODO: use a release
