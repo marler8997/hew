@@ -2,14 +2,19 @@
 
 hew builds and installs software from source.  Run `hew install PKGs...`.  The PKG tells hew where to get the source (i.e. `github:marler8997/msi`).
 
-Install hew with:
+Install hew on Linux/macOS with:
 
 ```sh
-curl https://gethew.github.io/sh | sh
+curl -f https://gethew.github.io/sh | sh
+```
 
-# windows
+Install hew on Windows:
+
+```sh
 powershell -c "irm https://gethew.github.io/ps1 | iex"
 ```
+
+Those install commands download a small script which in turn downloads a prebuilt hew binary and executes `hew install github:marler8997/hew`.
 
 # Package Format
 
