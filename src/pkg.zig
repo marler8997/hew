@@ -39,11 +39,11 @@ pub const Pkg = union(enum) {
                 if (std.mem.eql(u8, option, "tip")) {
                     if (commit != .latest_release) return .{ .err = .{ .option_conflict = .{ "tip", @tagName(commit) } } };
                     commit = .tip;
-                } else if (std.mem.startsWith(u8, option, "ref=")) {
-                    if (commit != .latest_release) return .{ .err = .{ .option_conflict = .{ "ref", @tagName(commit) } } };
-                    const ref = option["ref=".len..];
-                    if (ref.len == 0) return .{ .err = .{ .msg = "ref= requires a ref name" } };
-                    commit = .{ .ref = ref };
+                } else if (std.mem.startsWith(u8, option, "rev=")) {
+                    if (commit != .latest_release) return .{ .err = .{ .option_conflict = .{ "rev", @tagName(commit) } } };
+                    const rev = option["rev=".len..];
+                    if (rev.len == 0) return .{ .err = .{ .msg = "rev= requires a rev name" } };
+                    commit = .{ .rev = rev };
                 } else return .{ .err = .{ .unknown_option = option } };
             }
             return .{ .ok = .{ .github = .{ .owner_repo = owner_repo, .slash_index = slash_index, .commit = commit } } };
@@ -70,7 +70,7 @@ pub const PkgGithub = struct {
 
     pub const Commit = union(enum) {
         latest_release,
-        ref: []const u8,
+        rev: []const u8,
         tip,
     };
 

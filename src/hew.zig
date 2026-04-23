@@ -446,9 +446,9 @@ fn ensureAnyzig(
 }
 
 const GithubArchive = union(enum) {
-    ref: struct {
+    rev: struct {
         json: std.ArrayListUnmanaged(u8),
-        ref_name: []const u8,
+        rev_name: []const u8,
         tarball_url: []const u8,
     },
     tip: struct {
@@ -458,7 +458,7 @@ const GithubArchive = union(enum) {
     },
     pub fn deinit(archive: *GithubArchive, allocator: std.mem.Allocator) void {
         switch (archive.*) {
-            .ref => |*r| r.json.deinit(allocator),
+            .rev => |*r| r.json.deinit(allocator),
             .tip => |*t| {
                 allocator.free(t.tarball_url);
                 t.json.deinit(allocator);
@@ -469,7 +469,7 @@ const GithubArchive = union(enum) {
 
     pub fn url(archive: *const GithubArchive) []const u8 {
         return switch (archive.*) {
-            .ref => |*r| r.tarball_url,
+            .rev => |*r| r.tarball_url,
             .tip => |*t| t.tarball_url,
         };
     }
@@ -480,7 +480,7 @@ const GithubArchive = union(enum) {
         archive: *const GithubArchive,
         pub fn format(n: FmtUniqueName, w: *std.Io.Writer) error{WriteFailed}!void {
             switch (n.archive.*) {
-                .ref => |*r| try w.writeAll(r.ref_name),
+                .rev => |*r| try w.writeAll(r.rev_name),
                 .tip => |*t| try t.sha.format(w),
             }
         }
@@ -549,9 +549,9 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
                         std.process.exit(0xff);
                     },
                 };
-                break :blk .{ .ref = .{
+                break :blk .{ .rev = .{
                     .json = fetch_result.body,
-                    .ref_name = release.tag_name,
+                    .rev_name = release.tag_name,
                     .tarball_url = release.tarball_url,
                 } };
             }
@@ -595,22 +595,22 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
                 "https://api.github.com/repos/{s}/tarball/{s}",
                 .{ pkg.owner_repo, tag_name },
             ) catch |e| oom(e);
-            break :blk .{ .ref = .{
+            break :blk .{ .rev = .{
                 .json = tags_result.body,
-                .ref_name = tag_name,
+                .rev_name = tag_name,
                 .tarball_url = tarball_url,
             } };
         },
-        .ref => |ref| {
+        .rev => |rev| {
             const tarball_url = std.fmt.allocPrint(
                 scratch.allocator(),
                 "https://api.github.com/repos/{s}/tarball/{s}",
-                .{ pkg.owner_repo, ref },
+                .{ pkg.owner_repo, rev },
             ) catch |e| oom(e);
             errdefer scratch.allocator().free(tarball_url);
-            break :blk .{ .ref = .{
+            break :blk .{ .rev = .{
                 .json = .{},
-                .ref_name = ref,
+                .rev_name = rev,
                 .tarball_url = tarball_url,
             } };
         },

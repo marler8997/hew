@@ -1,20 +1,19 @@
 github:marler8997/hew
-github:marler8997/zipcmdline,ref=v2025_11_02
-github:marler8997/msi,ref=a8033245765dc3ec94cfe0d6f4f9d7725700c5b9
+github:marler8997/zipcmdline,rev=v2025_11_02
+github:marler8997/msi,rev=a8033245765dc3ec94cfe0d6f4f9d7725700c5b9
 # TODO: use a release
-github:marler8997/anyzig,ref=5d09af4578fe1ac1eb208f70f62253132f6013eb
+github:marler8997/anyzig,rev=5d09af4578fe1ac1eb208f70f62253132f6013eb
 # TODO: use a release
-github:marler8997/msvcup,ref=562a6058f25881afc9f580c99f86e41b95733a92
+github:marler8997/msvcup,rev=562a6058f25881afc9f580c99f86e41b95733a92
 # TODO: use a release
-github:marler8997/mite,ref=b09297d9f877c8c610e5bb6bc572e6249b1742a1 --disable-macos
+github:marler8997/mite,rev=b09297d9f877c8c610e5bb6bc572e6249b1742a1 --disable-macos
 
-# windows disabled due to errors in zig 0.15.0 fetching dependencies
 # commented out because v0.11.2 can't be built due to missing dependenty:
 #     git+https://github.com/hexops/xcode-frameworks.git#8a1cfb373587ea4c9bb1468b7c986462d8d4e10e
 #     github.com/hexops has moved to code.hexops.or
-# github:kristoff-it/zine,ref=v0.11.2 --disable-windows
+# github:kristoff-it/zine,rev=v0.11.2 --disable-windows
 
 # TODO: use a release, linux disabled because SDL has dependencies that may not be installed
 # I've commented this one out because there's an intermittent error "unrecognized 'Content-Type' header: 'text/html'"
 # that has happed on the CI from zig trying to fetch "https://thelettervsixtim.es/makeandplay/data.zip" from the zon file.
-# github:allyourcodebase/VVVVVV,ref=12b8d314b045b36e140c6bf33b73f06c94f94181 --disable-linux
+# github:allyourcodebase/VVVVVV,rev=12b8d314b045b36e140c6bf33b73f06c94f94181 --disable-linux

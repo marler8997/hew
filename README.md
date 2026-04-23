@@ -23,7 +23,7 @@ PKG = github:OWNER/REPO[,VERSION]
     | path:PATH
 
 VERSION = (omitted)    # in this priority tries latest release, tag or commit on the default branch
-        | ref=REFSPEC  # specific tag/commit
+        | rev=REVSPEC  # specific tag/commit
         | tip          # latest commit on default branch
 ```
 
@@ -31,8 +31,8 @@ VERSION = (omitted)    # in this priority tries latest release, tag or commit on
 
 ```sh
 hew install github:marler8997/msi
-hew install github:marler8997/msi,ref=v1.0
-hew install github:marler8997/msi,ref=a8033245765dc3ec94cfe0d6f4f9d7725700c5b9
+hew install github:marler8997/msi,rev=v1.0
+hew install github:marler8997/msi,rev=a8033245765dc3ec94cfe0d6f4f9d7725700c5b9
 hew install github:marler8997/msi,tip
 ```
 
