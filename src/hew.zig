@@ -549,6 +549,7 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
                         std.process.exit(0xff);
                     },
                 };
+                log.info("latest release is tag {s}", .{release.tag_name});
                 break :blk .{ .rev = .{
                     .json = fetch_result.body,
                     .rev_name = release.tag_name,
@@ -583,13 +584,16 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
                 .empty => {
                     log.info("no tags found either, falling back to tip for github:{s}...", .{pkg.owner_repo});
                     tags_result.body.deinit(scratch.allocator());
-                    break :blk fetchTip(scratch, scratch.allocator(), pkg.owner_repo, &client);
+                    const tip_archive = fetchTip(scratch, scratch.allocator(), pkg.owner_repo, &client);
+                    log.info("tip is commit {f}", .{&tip_archive.tip.sha});
+                    break :blk tip_archive;
                 },
                 .err => |*err| {
                     reportJsonError(scratch, tags_url, tags_result.body.items, err);
                     std.process.exit(0xff);
                 },
             };
+            log.info("latest tag is {s}", .{tag_name});
             const tarball_url = std.fmt.allocPrint(
                 scratch.allocator(),
                 "https://api.github.com/repos/{s}/tarball/{s}",
