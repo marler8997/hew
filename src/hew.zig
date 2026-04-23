@@ -777,12 +777,14 @@ fn hashFile(dir: std.fs.Dir, name: []const u8) ![32]u8 {
     return hasher.finalResult();
 }
 
+const ZigBuildMode = enum { fetch, build };
+
 fn runZigBuild(
     scratch: *Scratch,
     zig_path: []const u8,
     path: []const u8,
     dir: std.fs.Dir,
-    mode: enum { fetch, build },
+    mode: ZigBuildMode,
 ) error{Reported}!void {
     const position = scratch.position();
     defer scratch.restorePosition(position);
@@ -804,18 +806,47 @@ fn runZigBuild(
         } },
     );
 
+    const fetch_retry_delays_s = [_]u64{ 0, 2, 4 };
+    const max_attempts: u8 = switch (mode) {
+        .fetch => fetch_retry_delays_s.len + 1, // try multiple times to mitigate transient network errors
+        .build => 1,
+    };
+
+    var attempt: u8 = 1;
+    while (true) : (attempt += 1) {
+        const exit_code = try runZigBuildOnce(scratch, argv, label, path, dir);
+        if (exit_code == 0) return;
+        if (mode == .fetch and attempt < max_attempts) {
+            const delay_s = fetch_retry_delays_s[attempt - 1];
+            log.warn(
+                "{s} failed with exit code {}, attempt {d}/{d}, will retry in {d} seconds...",
+                .{ label, exit_code, attempt + 1, max_attempts, delay_s },
+            );
+            if (delay_s > 0) std.Thread.sleep(delay_s * std.time.ns_per_s);
+            continue;
+        }
+        errExit("{s} exited with code {d}", .{ label, exit_code });
+    }
+}
+
+fn runZigBuildOnce(
+    scratch: *Scratch,
+    argv: []const []const u8,
+    label: []const u8,
+    path: []const u8,
+    dir: std.fs.Dir,
+) error{Reported}!u8 {
     var timer = timerStart();
     var child = std.process.Child.init(argv, scratch.allocator());
     child.cwd = path;
     child.cwd_dir = dir;
+    child.stdin_behavior = .Ignore;
     child.spawn() catch |err| return reportError("run {s} failed with {t}", .{ label, err });
     const term = child.wait() catch |err| return reportError("{s} wait failed with {t}", .{ label, err });
     const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
     log.info("{s} completed in {d:.2} seconds", .{ label, elapsed });
     switch (term) {
-        .Exited => |code| if (code != 0) {
-            errExit("{s} exited with code {d}", .{ label, code });
-        },
+        .Exited => |code| return code,
         .Signal => |sig| errExit("{s} killed by signal {d}", .{ label, sig }),
         .Stopped => |sig| errExit("{s} stopped by signal {d}", .{ label, sig }),
         .Unknown => |val| errExit("{s} terminated with unknown status {d}", .{ label, val }),
