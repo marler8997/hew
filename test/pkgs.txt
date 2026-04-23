@@ -9,7 +9,10 @@ github:marler8997/msvcup,ref=562a6058f25881afc9f580c99f86e41b95733a92
 github:marler8997/mite,ref=b09297d9f877c8c610e5bb6bc572e6249b1742a1 --disable-macos
 
 # windows disabled due to errors in zig 0.15.0 fetching dependencies
-github:kristoff-it/zine,ref=v0.11.2 --disable-windows
+# commented out because v0.11.2 can't be built due to missing dependenty:
+#     git+https://github.com/hexops/xcode-frameworks.git#8a1cfb373587ea4c9bb1468b7c986462d8d4e10e
+#     github.com/hexops has moved to code.hexops.or
+# github:kristoff-it/zine,ref=v0.11.2 --disable-windows
 
 # TODO: use a release, linux disabled because SDL has dependencies that may not be installed
 # I've commented this one out because there's an intermittent error "unrecognized 'Content-Type' header: 'text/html'"
