@@ -5,7 +5,7 @@ hew builds and installs software from source.  Run `hew install PKGs...`.  The P
 Install hew on Linux/macOS with:
 
 ```sh
-curl -f https://gethew.github.io/sh | sh
+sh -c "$(curl -fSL https://gethew.github.io/sh)"
 ```
 
 Install hew on Windows:
