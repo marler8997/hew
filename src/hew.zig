@@ -1027,7 +1027,7 @@ fn installPkgPath(
             }
         }
 
-        zig_out_bin.copyFile(entry.name, dest_dir, entry.name, .{}) catch |err| return reportError(
+        copyOverwriteMaybeRunning(scratch, config.interactive, zig_out_bin, entry.name, dest_dir, config.bin_path, entry.name) catch |err| return reportError(
             "copy '{s}' to '{s}' failed with {t}",
             .{ entry.name, config.bin_path, err },
         );
@@ -1043,7 +1043,7 @@ fn installPkgPath(
                 .{entry.name},
             );
             if (zig_out_bin.access(pdb_name, .{})) {
-                zig_out_bin.copyFile(pdb_name, dest_dir, pdb_name, .{}) catch |err| return reportError(
+                copyOverwriteMaybeRunning(scratch, config.interactive, zig_out_bin, pdb_name, dest_dir, config.bin_path, pdb_name) catch |err| return reportError(
                     "copy '{s}' to '{s}' failed with {t}",
                     .{ pdb_name, config.bin_path, err },
                 );
@@ -1092,6 +1092,133 @@ fn installPkgPath(
         @as([]const u8, if (install_bin_count == 1) "" else "s"),
         config.bin_path,
     });
+}
+
+// On Windows you cannot overwrite a file while it's open for execution. If the
+// target is our own running executable, try to rename it out of the way
+// automatically (TMPDIR first, then same-dir); otherwise prompt the user.
+fn copyOverwriteMaybeRunning(
+    scratch: *Scratch,
+    interactive: bool,
+    src_dir: std.fs.Dir,
+    src_name: []const u8,
+    dest_dir: std.fs.Dir,
+    dest_dir_path: []const u8,
+    dest_name: []const u8,
+) !void {
+    while (true) {
+        src_dir.copyFile(src_name, dest_dir, dest_name, .{}) catch |err| switch (err) {
+            error.AccessDenied => if (builtin.os.tag != .windows) return err else {
+                const scratch_pos = scratch.position();
+                defer scratch.restorePosition(scratch_pos);
+                const abs_dest_path = std.fmt.allocPrint(
+                    scratch.allocator(),
+                    "{s}{c}{s}",
+                    .{ dest_dir_path, std.fs.path.sep, dest_name },
+                ) catch |e| oom(e);
+                if (try isSelfExe(abs_dest_path)) {
+                    if (try tryRenameOutOfWay(scratch, dest_dir, abs_dest_path, dest_dir_path, dest_name)) continue;
+                    // Auto-fallback exhausted; fall through to prompt.
+                }
+                if (!interactive) return error.AccessDenied;
+                switch (try promptRunningFileConflict(dest_dir_path, dest_name)) {
+                    .cancel => return error.AccessDenied,
+                    .rename => {
+                        var backup_buf: [std.fs.max_name_bytes]u8 = undefined;
+                        const backup_name = std.fmt.bufPrint(&backup_buf, "{s}.deleteme", .{dest_name}) catch
+                            errExit("name too long: '{s}.deleteme'", .{dest_name});
+                        dest_dir.deleteFile(backup_name) catch |e| switch (e) {
+                            error.FileNotFound => {},
+                            else => return e,
+                        };
+                        try dest_dir.rename(dest_name, backup_name);
+                        continue;
+                    },
+                    .retry => continue,
+                }
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
+fn isSelfExe(abs_target_path: []const u8) !bool {
+    var self_raw_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self_raw = try std.fs.selfExePath(&self_raw_buf);
+    var self_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const self_real = try std.posix.realpath(self_raw, &self_real_buf);
+
+    var target_real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target_real = std.posix.realpath(abs_target_path, &target_real_buf) catch |err| switch (err) {
+        // Target vanished between copy attempt and now — definitely not us.
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+
+    if (builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(self_real, target_real);
+    return std.mem.eql(u8, self_real, target_real);
+}
+
+/// Try TMPDIR rename, then same-dir `.deleteme` rename. Returns true if the
+/// file was moved out of the way (caller should retry the copy).
+fn tryRenameOutOfWay(
+    scratch: *Scratch,
+    dest_dir: std.fs.Dir,
+    abs_src_path: []const u8,
+    dest_dir_path: []const u8,
+    dest_name: []const u8,
+) !bool {
+    const tmp_path = allocTmpPath(scratch.allocator(), "hew-{s}.deleteme", .{dest_name});
+    std.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {}, // stale copy still locked; rename will fall through below
+    };
+    if (std.fs.renameAbsolute(abs_src_path, tmp_path)) {
+        log.info("renamed '{s}' to '{s}'", .{ abs_src_path, tmp_path });
+        return true;
+    } else |err| switch (err) {
+        error.RenameAcrossMountPoints => {}, // fall through to same-dir
+        else => return err,
+    }
+
+    var backup_buf: [std.fs.max_name_bytes]u8 = undefined;
+    const backup_name = std.fmt.bufPrint(&backup_buf, "{s}.deleteme", .{dest_name}) catch
+        errExit("name too long: '{s}.deleteme'", .{dest_name});
+    dest_dir.deleteFile(backup_name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return false, // existing backup can't be cleared; let prompt handle it
+    };
+    dest_dir.rename(dest_name, backup_name) catch return false;
+    log.info("renamed '{s}' to '{s}{c}{s}'", .{ abs_src_path, dest_dir_path, std.fs.path.sep, backup_name });
+    return true;
+}
+
+const RunningFileChoice = enum { cancel, rename, retry };
+
+fn promptRunningFileConflict(dest_dir_path: []const u8, dest_name: []const u8) !RunningFileChoice {
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    const w = &stderr.interface;
+    w.print(
+        \\'{s}{c}{s}' cannot be overwritten (file is in use, e.g. a running executable).
+        \\  0) cancel
+        \\  1) rename existing file to '{s}.deleteme' and install new file
+        \\  2) retry (choose after you've removed/stopped the blocker yourself)
+        \\
+    , .{ dest_dir_path, std.fs.path.sep, dest_name, dest_name }) catch |err| switch (err) {
+        error.WriteFailed => return stderr.err.?,
+    };
+    const choice = promptNumber(w, "choose", 2) catch |err| switch (err) {
+        error.WriteFailed => return stderr.err.?,
+        else => |e| return e,
+    };
+    return switch (choice) {
+        0 => .cancel,
+        1 => .rename,
+        2 => .retry,
+        else => unreachable,
+    };
 }
 
 const ManifestLine = union(enum) {
