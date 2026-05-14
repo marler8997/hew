@@ -1135,8 +1135,11 @@ fn copyOverwriteMaybeRunning(
                             },
                             else => return e,
                         };
-                        dest_dir.rename(dest_name, backup_name) catch |e| switch (e) {
-                            error.AccessDenied => {
+                        renameMaybeRunning(dest_dir, dest_name, dest_dir, backup_name) catch |e| switch (e) {
+                            error.AccessDenied,
+                            error.SharingViolation,
+                            error.DeletePending,
+                            => {
                                 log.err("rename '{s}' to '{s}' in directory '{s}' failed with {t}", .{ dest_name, backup_name, dest_dir_path, e });
                                 continue;
                             },
@@ -1170,6 +1173,63 @@ fn isSelfExe(abs_target_path: []const u8) !bool {
     return std.mem.eql(u8, self_real, target_real);
 }
 
+// `std.fs` rename (posix.renameatW) opens the source with GENERIC_WRITE, which
+// Windows refuses for a running executable. Win32 MoveFileEx renames in-use exes
+// fine because it opens the source needing only DELETE access — so do the same:
+// open with DELETE, then NtSetInformationFile with FileRenameInformation.
+fn renameMaybeRunning(
+    old_dir: std.fs.Dir,
+    old_name: []const u8,
+    new_dir: std.fs.Dir,
+    new_name: []const u8,
+) !void {
+    if (builtin.os.tag != .windows) return std.fs.rename(old_dir, old_name, new_dir, new_name);
+
+    const w = std.os.windows;
+    const old_path = try w.sliceToPrefixedFileW(old_dir.fd, old_name);
+    const new_path = try w.sliceToPrefixedFileW(new_dir.fd, new_name);
+    const new_w = new_path.span();
+
+    const src_fd = try w.OpenFile(old_path.span(), .{
+        .dir = old_dir.fd,
+        .access_mask = w.SYNCHRONIZE | w.DELETE,
+        .creation = w.FILE_OPEN,
+        .filter = .any,
+        .follow_symlinks = false,
+    });
+    defer w.CloseHandle(src_fd);
+
+    const struct_buf_len = @sizeOf(w.FILE_RENAME_INFORMATION) + (std.fs.max_path_bytes - 1);
+    var rename_info_buf: [struct_buf_len]u8 align(@alignOf(w.FILE_RENAME_INFORMATION)) = undefined;
+    const struct_len = @sizeOf(w.FILE_RENAME_INFORMATION) - 1 + new_w.len * 2;
+    if (struct_len > struct_buf_len) return error.NameTooLong;
+
+    const rename_info: *w.FILE_RENAME_INFORMATION = @ptrCast(&rename_info_buf);
+    rename_info.* = .{
+        .Flags = w.TRUE, // replace an existing target, matching std.fs.rename
+        .RootDirectory = if (std.fs.path.isAbsoluteWindowsWTF16(new_w)) null else new_dir.fd,
+        .FileNameLength = @intCast(new_w.len * 2),
+        .FileName = undefined,
+    };
+    @memcpy((&rename_info.FileName).ptr, new_w);
+
+    var io: w.IO_STATUS_BLOCK = undefined;
+    switch (w.ntdll.NtSetInformationFile(src_fd, &io, rename_info, @intCast(struct_len), .FileRenameInformation)) {
+        .SUCCESS => {},
+        .INVALID_HANDLE => unreachable,
+        .INVALID_PARAMETER => unreachable,
+        .OBJECT_PATH_SYNTAX_BAD => unreachable,
+        .ACCESS_DENIED => return error.AccessDenied,
+        .SHARING_VIOLATION => return error.SharingViolation,
+        .DELETE_PENDING => return error.DeletePending,
+        .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
+        .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
+        .NOT_SAME_DEVICE => return error.RenameAcrossMountPoints,
+        .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
+        else => |rc| return w.unexpectedStatus(rc),
+    }
+}
+
 /// Try TMPDIR rename, then same-dir `.deleteme` rename. Returns true if the
 /// file was moved out of the way (caller should retry the copy).
 fn tryRenameOutOfWay(
@@ -1180,17 +1240,23 @@ fn tryRenameOutOfWay(
     dest_name: []const u8,
 ) !bool {
     const tmp_path = allocTmpPath(scratch.allocator(), "hew-{s}.deleteme", .{dest_name});
-    std.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => {}, // stale copy still locked; rename will fall through below
-    };
-    if (std.fs.renameAbsolute(abs_src_path, tmp_path)) {
-        log.info("renamed '{s}' to '{s}'", .{ abs_src_path, tmp_path });
-        return true;
-    } else |err| switch (err) {
-        error.RenameAcrossMountPoints => {}, // fall through to same-dir
-        else => return err,
-    }
+    const tmp_dir_path = std.fs.path.dirname(tmp_path).?;
+    const tmp_name = std.fs.path.basename(tmp_path);
+    if (std.fs.openDirAbsolute(tmp_dir_path, .{})) |opened| {
+        var tmp_dir = opened;
+        defer tmp_dir.close();
+        tmp_dir.deleteFile(tmp_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => {}, // stale copy still locked; rename below will replace it or fail
+        };
+        if (renameMaybeRunning(dest_dir, dest_name, tmp_dir, tmp_name)) {
+            log.info("renamed '{s}' to '{s}'", .{ abs_src_path, tmp_path });
+            return true;
+        } else |err| switch (err) {
+            error.RenameAcrossMountPoints => {}, // fall through to same-dir
+            else => return err,
+        }
+    } else |_| {} // can't open TMPDIR; fall through to same-dir
 
     var backup_buf: [std.fs.max_name_bytes]u8 = undefined;
     const backup_name = std.fmt.bufPrint(&backup_buf, "{s}.deleteme", .{dest_name}) catch
@@ -1199,7 +1265,7 @@ fn tryRenameOutOfWay(
         error.FileNotFound => {},
         else => return false, // existing backup can't be cleared; let prompt handle it
     };
-    dest_dir.rename(dest_name, backup_name) catch return false;
+    renameMaybeRunning(dest_dir, dest_name, dest_dir, backup_name) catch return false;
     log.info("renamed '{s}' to '{s}{c}{s}'", .{ abs_src_path, dest_dir_path, std.fs.path.sep, backup_name });
     return true;
 }
