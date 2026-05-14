@@ -1122,16 +1122,26 @@ fn copyOverwriteMaybeRunning(
                 }
                 if (!interactive) return error.AccessDenied;
                 switch (try promptRunningFileConflict(dest_dir_path, dest_name)) {
-                    .cancel => return error.AccessDenied,
+                    .cancel => errExit("install cancelled", .{}),
                     .rename => {
                         var backup_buf: [std.fs.max_name_bytes]u8 = undefined;
                         const backup_name = std.fmt.bufPrint(&backup_buf, "{s}.deleteme", .{dest_name}) catch
                             errExit("name too long: '{s}.deleteme'", .{dest_name});
                         dest_dir.deleteFile(backup_name) catch |e| switch (e) {
                             error.FileNotFound => {},
+                            error.AccessDenied => {
+                                log.err("delete existing '{s}{c}{s}' failed with {t}", .{ dest_dir_path, std.fs.path.sep, backup_name, e });
+                                continue;
+                            },
                             else => return e,
                         };
-                        try dest_dir.rename(dest_name, backup_name);
+                        dest_dir.rename(dest_name, backup_name) catch |e| switch (e) {
+                            error.AccessDenied => {
+                                log.err("rename '{s}{c}{s}' to '{s}' failed with {t}", .{ dest_dir_path, std.fs.path.sep, dest_name, backup_name, e });
+                                continue;
+                            },
+                            else => return e,
+                        };
                         continue;
                     },
                     .retry => continue,
