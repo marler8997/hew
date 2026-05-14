@@ -1137,7 +1137,7 @@ fn copyOverwriteMaybeRunning(
                         };
                         dest_dir.rename(dest_name, backup_name) catch |e| switch (e) {
                             error.AccessDenied => {
-                                log.err("rename '{s}{c}{s}' to '{s}' failed with {t}", .{ dest_dir_path, std.fs.path.sep, dest_name, backup_name, e });
+                                log.err("rename '{s}' to '{s}' in directory '{s}' failed with {t}", .{ dest_name, backup_name, dest_dir_path, e });
                                 continue;
                             },
                             else => return e,
