@@ -252,7 +252,7 @@ fn installPkg(scratch: *Scratch, config: *const InstallConfig, pkg: Pkg) !void {
     defer scratch.restorePosition(scratch_pos);
     switch (pkg) {
         .github => |p| try installPkgGithub(scratch, config, p),
-        .path => |p| try installPkgPath(scratch, config, @panic("todo: manifest path"), p),
+        .path => |p| try installPkgPath(scratch, config, @panic("todo: manifest path"), p, .installed_from_path),
     }
 }
 
@@ -471,6 +471,12 @@ const GithubArchive = union(enum) {
         return switch (archive.*) {
             .rev => |*r| r.tarball_url,
             .tip => |*t| t.tarball_url,
+        };
+    }
+    pub fn allocRevision(archive: *const GithubArchive, allocator: std.mem.Allocator) []u8 {
+        return switch (archive.*) {
+            .rev => |*r| allocator.dupe(u8, r.rev_name) catch |e| oom(e),
+            .tip => |*t| std.fmt.allocPrint(allocator, "{f}", .{t.sha}) catch |e| oom(e),
         };
     }
     pub fn fmtUniqueName(archive: *const GithubArchive) FmtUniqueName {
@@ -697,7 +703,9 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
             .{ .strip_components = 1 },
         ) catch |err| return reportError("extract tarball failed with {t}", .{err});
         log.info("extracted to {s}", .{extract_dir_path});
-        try installPkgPath(scratch, config, manifest_path, extract_dir_path);
+        const revision = archive.allocRevision(scratch.allocator());
+        defer scratch.free(revision);
+        try installPkgPath(scratch, config, manifest_path, extract_dir_path, .{ .revision = revision });
     }
     log.info("clean source: rm -rf {s}", .{extract_dir_path});
     std.fs.deleteTreeAbsolute(extract_dir_path) catch |err|
@@ -786,6 +794,7 @@ fn runZigBuild(
     zig_path: []const u8,
     path: []const u8,
     dir: std.fs.Dir,
+    env_map: *const std.process.EnvMap,
     mode: enum { fetch, build },
 ) error{Reported}!void {
     const position = scratch.position();
@@ -812,6 +821,8 @@ fn runZigBuild(
     var child = std.process.Child.init(argv, scratch.allocator());
     child.cwd = path;
     child.cwd_dir = dir;
+    child.env_map = env_map;
+
     child.spawn() catch |err| return reportError("run {s} failed with {t}", .{ label, err });
     const term = child.wait() catch |err| return reportError("{s} wait failed with {t}", .{ label, err });
     const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
@@ -904,11 +915,17 @@ fn writeManifest(scratch: *Scratch, manifest_path: []const u8, source_dir: std.f
         return reportError("rename '{s}' to '{s}' failed with {t}", .{ tmp_name, manifest_name, err });
 }
 
+const BuildRevision = union(enum) {
+    installed_from_path,
+    revision: []const u8,
+};
+
 fn installPkgPath(
     scratch: *Scratch,
     config: *const InstallConfig,
     manifest_path: []const u8,
     path: []const u8,
+    revision: BuildRevision,
 ) !void {
     const scratch_pos = scratch.position();
     defer scratch.restorePosition(scratch_pos);
@@ -935,8 +952,18 @@ fn installPkgPath(
     defer scratch.free(zig_path);
     try ensureAnyzig(scratch, config.cache_path, zig_path);
 
-    try runZigBuild(scratch, zig_path, path, dir, .fetch);
-    try runZigBuild(scratch, zig_path, path, dir, .build);
+    var env_map = std.process.getEnvMap(scratch.allocator()) catch |err| switch (err) {
+        error.OutOfMemory => |e| oom(e),
+        error.Unexpected => return reportError("get environment failed with {t}", .{err}),
+    };
+    defer env_map.deinit();
+    switch (revision) {
+        .installed_from_path => {},
+        .revision => |r| env_map.put("HEW_BUILD_REVISION", r) catch |e| oom(e),
+    }
+
+    try runZigBuild(scratch, zig_path, path, dir, &env_map, .fetch);
+    try runZigBuild(scratch, zig_path, path, dir, &env_map, .build);
 
     try writeManifest(scratch, manifest_path, dir);
     std.log.info("wrote manifest to '{s}'", .{manifest_path});

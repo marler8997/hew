@@ -25,7 +25,12 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .single_threaded = true,
             .imports = &.{
-                .{ .name = "version", .module = dev_version_embed },
+                .{
+                    .name = "version",
+                    .module = if (b.graph.env_map.get("HEW_BUILD_REVISION")) |r| b.createModule(.{
+                        .root_source_file = write_files_version.add("version-release-native", b.fmt("{s}-native", .{r})),
+                    }) else dev_version_embed,
+                },
             },
         }),
     });
