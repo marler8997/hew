@@ -1108,7 +1108,7 @@ fn copyOverwriteMaybeRunning(
 ) !void {
     while (true) {
         src_dir.copyFile(src_name, dest_dir, dest_name, .{}) catch |err| switch (err) {
-            error.AccessDenied => if (builtin.os.tag != .windows) return err else {
+            error.AccessDenied => |copy_file_error| if (builtin.os.tag != .windows) return err else {
                 const scratch_pos = scratch.position();
                 defer scratch.restorePosition(scratch_pos);
                 const abs_dest_path = std.fmt.allocPrint(
@@ -1120,7 +1120,7 @@ fn copyOverwriteMaybeRunning(
                     if (try tryRenameOutOfWay(scratch, dest_dir, abs_dest_path, dest_dir_path, dest_name)) continue;
                     // Auto-fallback exhausted; fall through to prompt.
                 }
-                if (!interactive) return error.AccessDenied;
+                if (!interactive) return copy_file_error;
                 switch (try promptRunningFileConflict(dest_dir_path, dest_name)) {
                     .cancel => errExit("install cancelled", .{}),
                     .rename => {
