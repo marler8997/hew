@@ -14,7 +14,7 @@ Install hew on Windows:
 powershell -c "irm https://gethew.github.io/ps1 | iex"
 ```
 
-Those install commands download a small script which in turn downloads a prebuilt hew binary and executes `hew install github:marler8997/hew`.
+Those install commands download a small script which in turn downloads a prebuilt hew binary and executes `hew install github:hew-org/hew`.
 
 # Package Format
 
