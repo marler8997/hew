@@ -592,7 +592,7 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
             const tag_name = blk_tag: {
                 var err: ParseJsonError = undefined;
                 break :blk_tag (parseLatestTag(tags_result.body.items, &err) catch |e| switch (e) {
-                    error.InvalidJson => jsonErrorExit(scratch, tags_url, tags_result.body.items, &err),
+                    error.ParseJson => jsonErrorExit(scratch, tags_url, tags_result.body.items, &err),
                 }) orelse {
                     log.info("no tags found either, falling back to tip for github:{s}...", .{pkg.owner_repo});
                     tags_result.body.deinit(scratch.allocator());
@@ -1474,23 +1474,15 @@ const ParseJsonError = struct {
     at: usize,
     why: Why,
     const Why = union(enum) {
-        unexpected_token: json.ParseError.UnexpectedToken,
+        unexpected_token: struct { expected: [:0]const u8, got: json.Token.Tag },
         invalid_value,
-        invalid_git_sha: json.Loc,
+        invalid_git_sha: []const u8,
         missing_field: [:0]const u8,
     };
 
-    pub fn set(err: *ParseJsonError, at: usize, why: Why) error{InvalidJson} {
+    pub fn set(err: *ParseJsonError, at: usize, why: Why) error{ParseJson} {
         err.* = .{ .at = at, .why = why };
-        return error.InvalidJson;
-    }
-
-    pub fn fromJson(err: *ParseJsonError, j: json.ParseError) error{InvalidJson} {
-        err.* = .{ .at = j.at, .why = switch (j.why) {
-            .unexpected_token => |u| .{ .unexpected_token = u },
-            .invalid_value => .invalid_value,
-        } };
-        return error.InvalidJson;
+        return error.ParseJson;
     }
 
     pub fn fmt(err: *const ParseJsonError, text: []const u8) Fmt {
@@ -1503,9 +1495,9 @@ const ParseJsonError = struct {
             const lc = getLineCol(f.text, f.err.at);
             try writer.print("{d}:{d}: ", .{ lc[0], lc[1] });
             switch (f.err.why) {
-                .unexpected_token => |u| try json.ParseError.formatWhy(.{ .unexpected_token = u }, writer),
-                .invalid_value => try json.ParseError.formatWhy(.invalid_value, writer),
-                .invalid_git_sha => |loc| try writer.print("invalid git sha: \"{s}\"", .{loc.slice(f.text)}),
+                .unexpected_token => |u| try writer.print("expected {s}, got {s}", .{ u.expected, u.got.desc() }),
+                .invalid_value => try writer.writeAll("invalid JSON value"),
+                .invalid_git_sha => |s| try writer.print("invalid git sha: \"{s}\"", .{s}),
                 .missing_field => |name| try writer.print("missing required field \"{s}\"", .{name}),
             }
         }
@@ -1554,10 +1546,22 @@ fn reportJsonError(
 
     const name_start = tmp_path.len - ext.len - url_path.len;
     for (tmp_path[name_start..]) |*c| {
-        if (c.* == '/') c.* = '-';
+        switch (c.*) {
+            '/', '?' => c.* = '-',
+            else => {},
+        }
     }
 
     const saved = blk: {
+        if (std.fs.path.dirname(tmp_path)) |dir| {
+            std.fs.cwd().makePath(dir) catch |create_dir_error| {
+                log.warn(
+                    "create dir '{s}' (to save JSON response) failed with {t}",
+                    .{ dir, create_dir_error },
+                );
+                break :blk false;
+            };
+        }
         const f = std.fs.createFileAbsolute(tmp_path, .{}) catch |save_err| {
             log.warn("save JSON to '{s}' failed with {t}", .{ tmp_path, save_err });
             break :blk false;
@@ -1579,101 +1583,154 @@ fn reportJsonError(
 }
 
 /// Parse the "message" field from a JSON object like {"message":"Not Found",...}
-fn parseMessage(text: []const u8, err: *ParseJsonError) error{InvalidJson}![]const u8 {
-    var json_error: json.ParseError = undefined;
-    return parseMessageInner(text, &json_error) catch |e| switch (e) {
-        error.InvalidJson => return err.fromJson(json_error),
-        error.MissingField => return err.set(0, .{ .missing_field = "message" }),
-    };
-}
-fn parseMessageInner(text: []const u8, err: *json.ParseError) error{ InvalidJson, MissingField }![]const u8 {
-    var it = try json.ObjectIterator.init(text, 0, err);
-    while (try it.next(err)) |key| {
-        if (std.mem.eql(u8, key, "message"))
-            return (try it.takeString(err)).slice(text);
-        try it.skip(err);
+fn parseMessage(text: []const u8, err: *ParseJsonError) error{ParseJson}![]const u8 {
+    var index = try parseJsonObjectStart(err, text, 0);
+    var first_field = true;
+    while (try parseJsonField(err, text, &first_field, &index)) |name| {
+        if (std.mem.eql(u8, name, "message")) {
+            const value, index = try parseJsonString(err, text, index);
+            return value;
+        }
+        index = try scanJsonValue(err, text, index);
     }
-    return error.MissingField;
+    return err.set(0, .{ .missing_field = "message" });
+}
+
+fn parseJsonObjectStart(err: *ParseJsonError, text: []const u8, start: usize) error{ParseJson}!usize {
+    const token = json.lex(text, start);
+    if (token.tag != .@"{") return err.set(token.start, .{
+        .unexpected_token = .{ .expected = "\"{\"", .got = token.tag },
+    });
+    return token.end;
+}
+fn parseJsonField(
+    err: *ParseJsonError,
+    text: []const u8,
+    first_field_ref: *bool,
+    index_ref: *usize,
+) error{ParseJson}!?[]const u8 {
+    const after_comma = blk: {
+        if (first_field_ref.*) {
+            const token = json.lex(text, index_ref.*);
+            if (token.tag == .@"}") {
+                index_ref.* = token.end;
+                return null;
+            }
+
+            first_field_ref.* = false;
+            break :blk index_ref.*;
+        }
+        const token = json.lex(text, index_ref.*);
+        switch (token.tag) {
+            .@"}" => {
+                index_ref.* = token.end;
+                return null;
+            },
+            .@"," => break :blk token.end,
+            else => return err.set(token.start, .{ .unexpected_token = .{
+                .expected = "\"}\" or another object field",
+                .got = token.tag,
+            } }),
+        }
+    };
+    const key_token = json.lex(text, after_comma);
+    if (key_token.tag != .string) return err.set(key_token.start, .{
+        .unexpected_token = .{ .expected = "field key string", .got = key_token.tag },
+    });
+    const key = text[key_token.start + 1 .. key_token.end - 1];
+
+    const colon = json.lex(text, key_token.end);
+    if (colon.tag != .@":") return err.set(colon.start, .{
+        .unexpected_token = .{ .expected = "\":\"", .got = colon.tag },
+    });
+    index_ref.* = colon.end;
+    return key;
+}
+
+fn parseJsonArrayStart(err: *ParseJsonError, text: []const u8, start: usize) error{ParseJson}!usize {
+    const token = json.lex(text, start);
+    if (token.tag != .@"[") return err.set(token.start, .{
+        .unexpected_token = .{ .expected = "\"[\"", .got = token.tag },
+    });
+    return token.end;
+}
+fn parseJsonArrayEnd(text: []const u8, index: *usize) bool {
+    const token = json.lex(text, index.*);
+    if (token.tag == .@"]") {
+        index.* = token.end;
+        return true;
+    }
+    return false;
+}
+
+fn parseJsonString(err: *ParseJsonError, text: []const u8, start: usize) error{ParseJson}!struct { []const u8, usize } {
+    const token = json.lex(text, start);
+    if (token.tag == .string) return .{ text[token.start + 1 .. token.end - 1], token.end };
+    return err.set(token.start, .{ .unexpected_token = .{ .expected = "a string", .got = token.tag } });
+}
+
+fn scanJsonValue(err: *ParseJsonError, text: []const u8, start: usize) error{ParseJson}!usize {
+    return json.skipValue(text, start) orelse return err.set(
+        json.lex(text, start).start,
+        .invalid_value,
+    );
 }
 
 /// Parse the "name" field from the first element of a JSON array: [{"name":"tag",...},...]
 /// Returns null if the array is empty (there are no tags).
-fn parseLatestTag(text: []const u8, err: *ParseJsonError) error{InvalidJson}!?[]const u8 {
-    var json_error: json.ParseError = undefined;
-    return parseLatestTagInner(text, &json_error) catch |e| switch (e) {
-        error.MissingField => return err.set(0, .{ .missing_field = "name" }),
-        error.InvalidJson => return err.fromJson(json_error),
-    };
-}
-fn parseLatestTagInner(text: []const u8, err: *json.ParseError) error{ InvalidJson, MissingField }!?[]const u8 {
-    const open = json.lex(text, 0);
-    if (open.tag != .@"[")
-        return err.set(open.start, .{ .unexpected_token = .{ .expected = "\"[\"", .got = open.tag } });
-    const first = json.lex(text, open.end);
-    if (first.tag == .@"]") return null;
-    if (first.tag != .@"{")
-        return err.set(first.start, .{ .unexpected_token = .{ .expected = "\"{\"", .got = first.tag } });
-    var it = json.ObjectIterator.initOpened(text, first.end);
-    while (try it.next(err)) |key| {
-        if (std.mem.eql(u8, key, "name")) {
-            const loc = try it.takeString(err);
-            return text[loc.start..loc.limit];
+fn parseLatestTag(text: []const u8, err: *ParseJsonError) error{ParseJson}!?[]const u8 {
+    var index = try parseJsonArrayStart(err, text, 0);
+    if (parseJsonArrayEnd(text, &index)) return null;
+
+    const object_start_token = json.lex(text, index);
+    index = try parseJsonObjectStart(err, text, object_start_token.start);
+    var first_field: bool = true;
+    while (try parseJsonField(err, text, &first_field, &index)) |name| {
+        if (std.mem.eql(u8, name, "name")) {
+            const value, index = try parseJsonString(err, text, index);
+            return value;
         }
-        try it.skip(err);
+        index = try scanJsonValue(err, text, index);
     }
-    return error.MissingField;
+
+    return err.set(object_start_token.start, .{ .missing_field = "name" });
 }
 
-fn parseRelease(text: []const u8, err: *ParseJsonError) error{InvalidJson}!Release {
-    var json_error: json.ParseError = undefined;
-    return parseReleaseInner(text, &json_error) catch |e| switch (e) {
-        error.InvalidJson => return err.fromJson(json_error),
-        error.MissingFieldTagName => return err.set(0, .{ .missing_field = "tag_name" }),
-        error.MissingFieldTarballUrl => return err.set(0, .{ .missing_field = "tarball_url" }),
-    };
-}
-fn parseReleaseInner(text: []const u8, err: *json.ParseError) error{
-    InvalidJson,
-    MissingFieldTagName,
-    MissingFieldTarballUrl,
-}!Release {
-    var it = try json.ObjectIterator.init(text, 0, err);
-    var tag_name: ?json.Loc = null;
-    var tarball_url: ?json.Loc = null;
-    while (try it.next(err)) |key| {
-        if (std.mem.eql(u8, key, "tag_name")) {
-            tag_name = try it.takeString(err);
-        } else if (std.mem.eql(u8, key, "tarball_url")) {
-            tarball_url = try it.takeString(err);
-        } else try it.skip(err);
+fn parseRelease(text: []const u8, err: *ParseJsonError) error{ParseJson}!Release {
+    var index = try parseJsonObjectStart(err, text, 0);
+    var first_field: bool = true;
+    var tag_name: ?[]const u8 = null;
+    var tarball_url: ?[]const u8 = null;
+    while (try parseJsonField(err, text, &first_field, &index)) |name| {
+        if (std.mem.eql(u8, name, "tag_name")) {
+            tag_name, index = try parseJsonString(err, text, index);
+        } else if (std.mem.eql(u8, name, "tarball_url")) {
+            tarball_url, index = try parseJsonString(err, text, index);
+        } else {
+            index = try scanJsonValue(err, text, index);
+        }
     }
     return .{
-        .tag_name = (tag_name orelse return error.MissingFieldTagName).slice(text),
-        .tarball_url = (tarball_url orelse return error.MissingFieldTarballUrl).slice(text),
+        .tag_name = tag_name orelse return err.set(0, .{ .missing_field = "tag_name" }),
+        .tarball_url = tarball_url orelse return err.set(0, .{ .missing_field = "tarball_url" }),
     };
 }
 
-fn parseCommitSha(text: []const u8, err: *ParseJsonError) error{InvalidJson}!GitSha {
-    var json_error: json.ParseError = undefined;
-    const sha_loc = parseCommitShaInner(text, &json_error) catch |e| switch (e) {
-        error.InvalidJson => return err.fromJson(json_error),
-        error.MissingField => return err.set(0, .{ .missing_field = "sha" }),
-    };
-    if (sha_loc.len() == 40) {
-        if (GitSha.fromHex(text[sha_loc.start..][0..40])) |sha| return sha;
-    }
-    return err.set(sha_loc.start, .{ .invalid_git_sha = sha_loc });
-}
-fn parseCommitShaInner(text: []const u8, err: *json.ParseError) error{ InvalidJson, MissingField }!json.Loc {
-    var it = try json.ObjectIterator.init(text, 0, err);
-    while (try it.next(err)) |key| {
-        if (!std.mem.eql(u8, key, "sha")) {
-            try it.skip(err);
-            continue;
+fn parseCommitSha(text: []const u8, err: *ParseJsonError) error{ParseJson}!GitSha {
+    var index = try parseJsonObjectStart(err, text, 0);
+    var first_field: bool = true;
+    while (try parseJsonField(err, text, &first_field, &index)) |name| {
+        if (std.mem.eql(u8, name, "sha")) {
+            const value_first_token = json.lex(text, index);
+            const hex, index = try parseJsonString(err, text, value_first_token.start);
+            if (hex.len == 40) {
+                if (GitSha.fromHex(hex[0..40])) |sha| return sha;
+            }
+            return err.set(value_first_token.start, .{ .invalid_git_sha = hex });
         }
-        return try it.takeString(err);
+        index = try scanJsonValue(err, text, index);
     }
-    return error.MissingField;
+    return err.set(0, .{ .missing_field = "sha" });
 }
 
 fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8, pkg_cache_path: []const u8) error{Reported}!void {
