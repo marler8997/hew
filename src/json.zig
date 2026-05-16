@@ -164,4 +164,89 @@ fn skipCompound(text: []const u8, start: usize, open: Token.Tag) ?usize {
     return pos;
 }
 
+pub const ParseError = struct {
+    at: usize,
+    why: Why,
+    pub const Why = union(enum) {
+        unexpected_token: UnexpectedToken,
+        invalid_value,
+    };
+    pub const UnexpectedToken = struct { expected: [:0]const u8, got: Token.Tag };
+
+    pub fn set(err: *ParseError, at: usize, why: Why) error{InvalidJson} {
+        err.* = .{ .at = at, .why = why };
+        return error.InvalidJson;
+    }
+
+    pub fn formatWhy(why: Why, w: *std.Io.Writer) error{WriteFailed}!void {
+        switch (why) {
+            .unexpected_token => |u| try w.print("expected {s}, got {s}", .{ u.expected, u.got.desc() }),
+            .invalid_value => try w.writeAll("invalid JSON value"),
+        }
+    }
+};
+
+pub const Loc = struct {
+    start: usize,
+    limit: usize,
+    pub fn len(loc: Loc) usize {
+        return loc.limit - loc.start;
+    }
+    pub fn slice(loc: Loc, text: []const u8) []const u8 {
+        return text[loc.start..loc.limit];
+    }
+};
+
+pub const ObjectIterator = struct {
+    text: []const u8,
+    pos: usize,
+    is_first: bool,
+
+    pub fn init(text: []const u8, lex_start: usize, err: *ParseError) error{InvalidJson}!ObjectIterator {
+        const open = lex(text, lex_start);
+        if (open.tag != .@"{")
+            return err.set(open.start, .{ .unexpected_token = .{ .expected = "\"{\"", .got = open.tag } });
+        return initOpened(text, open.end);
+    }
+
+    pub fn initOpened(text: []const u8, inside_pos: usize) ObjectIterator {
+        return .{ .text = text, .pos = inside_pos, .is_first = true };
+    }
+
+    pub fn next(it: *ObjectIterator, err: *ParseError) error{InvalidJson}!?[]const u8 {
+        const key_lex_pos = blk: {
+            const token = lex(it.text, it.pos);
+            if (token.tag == .@"}") return null;
+            if (it.is_first) break :blk it.pos;
+            if (token.tag != .@",")
+                return err.set(token.start, .{ .unexpected_token = .{ .expected = "\",\" or \"}\"", .got = token.tag } });
+            break :blk token.end;
+        };
+
+        const key_token = lex(it.text, key_lex_pos);
+        if (key_token.tag != .string)
+            return err.set(key_token.start, .{ .unexpected_token = .{ .expected = "field key string", .got = key_token.tag } });
+        const key = it.text[key_token.start + 1 .. key_token.end - 1];
+
+        const colon = lex(it.text, key_token.end);
+        if (colon.tag != .@":")
+            return err.set(colon.start, .{ .unexpected_token = .{ .expected = "\":\"", .got = colon.tag } });
+        it.pos = colon.end;
+        it.is_first = false;
+        return key;
+    }
+
+    pub fn takeString(it: *ObjectIterator, err: *ParseError) error{InvalidJson}!Loc {
+        const tok = lex(it.text, it.pos);
+        if (tok.tag != .string)
+            return err.set(tok.start, .{ .unexpected_token = .{ .expected = "string value", .got = tok.tag } });
+        it.pos = tok.end;
+        return .{ .start = tok.start + 1, .limit = tok.end - 1 };
+    }
+
+    pub fn skip(it: *ObjectIterator, err: *ParseError) error{InvalidJson}!void {
+        it.pos = skipValue(it.text, it.pos) orelse return err.set(it.pos, .invalid_value);
+    }
+};
+
 const std = @import("std");

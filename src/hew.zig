@@ -507,12 +507,12 @@ fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: []const
         fetchErrExit(commit_url, commit_result);
     const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
     log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
-    const sha = switch (parseCommitSha(commit_result.body.items)) {
-        .ok => |sha| sha,
-        .err => |*err| {
-            reportJsonError(scratch, commit_url, commit_result.body.items, err);
-            std.process.exit(0xff);
-        },
+    const sha = blk: {
+        var err: ParseJsonError = undefined;
+        break :blk parseCommitSha(
+            commit_result.body.items,
+            &err,
+        ) catch jsonErrorExit(scratch, commit_url, commit_result.body.items, &err);
     };
     const tarball_url = std.fmt.allocPrint(
         allocator,
@@ -548,12 +548,12 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
             if (fetch_result.status == .ok) {
                 const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
                 log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
-                const release = switch (parseRelease(fetch_result.body.items)) {
-                    .ok => |release| release,
-                    .err => |*err| {
-                        reportJsonError(scratch, release_url, fetch_result.body.items, err);
-                        std.process.exit(0xff);
-                    },
+                const release = blk_release: {
+                    var err: ParseJsonError = undefined;
+                    break :blk_release parseRelease(
+                        fetch_result.body.items,
+                        &err,
+                    ) catch jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
                 };
                 log.info("latest release is tag {s}", .{release.tag_name});
                 break :blk .{ .rev = .{
@@ -564,8 +564,12 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
             }
             // Only fall back to tags if the releases endpoint returned "Not Found".
             // Other 404s (e.g. repo doesn't exist) should still be fatal.
-            const is_no_releases = fetch_result.status == .not_found and
-                if (parseMessage(fetch_result.body.items)) |msg| std.mem.eql(u8, msg, "Not Found") else false;
+            const is_no_releases = fetch_result.status == .not_found and blk_msg: {
+                var err: ParseJsonError = undefined;
+                const msg = parseMessage(fetch_result.body.items, &err) catch
+                    jsonErrorExit(scratch, release_url, fetch_result.body.items, &err);
+                break :blk_msg std.mem.eql(u8, msg, "Not Found");
+            };
             if (!is_no_releases)
                 fetchErrExit(release_url, fetch_result);
             fetch_result.body.deinit(scratch.allocator());
@@ -585,19 +589,17 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
                 fetchErrExit(tags_url, tags_result);
             const tags_elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
             log.info("fetched latest tag JSON in {d:.2} seconds", .{tags_elapsed});
-            const tag_name = switch (parseLatestTag(tags_result.body.items)) {
-                .ok => |name| name,
-                .empty => {
+            const tag_name = blk_tag: {
+                var err: ParseJsonError = undefined;
+                break :blk_tag (parseLatestTag(tags_result.body.items, &err) catch |e| switch (e) {
+                    error.InvalidJson => jsonErrorExit(scratch, tags_url, tags_result.body.items, &err),
+                }) orelse {
                     log.info("no tags found either, falling back to tip for github:{s}...", .{pkg.owner_repo});
                     tags_result.body.deinit(scratch.allocator());
                     const tip_archive = fetchTip(scratch, scratch.allocator(), pkg.owner_repo, &client);
                     log.info("tip is commit {f}", .{&tip_archive.tip.sha});
                     break :blk tip_archive;
-                },
-                .err => |*err| {
-                    reportJsonError(scratch, tags_url, tags_result.body.items, err);
-                    std.process.exit(0xff);
-                },
+                };
             };
             log.info("latest tag is {s}", .{tag_name});
             const tarball_url = std.fmt.allocPrint(
@@ -1472,11 +1474,24 @@ const ParseJsonError = struct {
     at: usize,
     why: Why,
     const Why = union(enum) {
-        unexpected_token: struct { expected: [:0]const u8, got: json.Token.Tag },
+        unexpected_token: json.ParseError.UnexpectedToken,
         invalid_value,
-        invalid_git_sha: []const u8,
+        invalid_git_sha: json.Loc,
         missing_field: [:0]const u8,
     };
+
+    pub fn set(err: *ParseJsonError, at: usize, why: Why) error{InvalidJson} {
+        err.* = .{ .at = at, .why = why };
+        return error.InvalidJson;
+    }
+
+    pub fn fromJson(err: *ParseJsonError, j: json.ParseError) error{InvalidJson} {
+        err.* = .{ .at = j.at, .why = switch (j.why) {
+            .unexpected_token => |u| .{ .unexpected_token = u },
+            .invalid_value => .invalid_value,
+        } };
+        return error.InvalidJson;
+    }
 
     pub fn fmt(err: *const ParseJsonError, text: []const u8) Fmt {
         return .{ .err = err, .text = text };
@@ -1488,9 +1503,9 @@ const ParseJsonError = struct {
             const lc = getLineCol(f.text, f.err.at);
             try writer.print("{d}:{d}: ", .{ lc[0], lc[1] });
             switch (f.err.why) {
-                .unexpected_token => |u| try writer.print("expected {s}, got {s}", .{ u.expected, u.got.desc() }),
-                .invalid_value => try writer.writeAll("invalid JSON value"),
-                .invalid_git_sha => |v| try writer.print("invalid git sha: \"{s}\"", .{v}),
+                .unexpected_token => |u| try json.ParseError.formatWhy(.{ .unexpected_token = u }, writer),
+                .invalid_value => try json.ParseError.formatWhy(.invalid_value, writer),
+                .invalid_git_sha => |loc| try writer.print("invalid git sha: \"{s}\"", .{loc.slice(f.text)}),
                 .missing_field => |name| try writer.print("missing required field \"{s}\"", .{name}),
             }
         }
@@ -1509,6 +1524,16 @@ fn getLineCol(text: []const u8, offset: usize) struct { usize, usize } {
         else => col += 1,
     };
     return .{ line, col };
+}
+
+fn jsonErrorExit(
+    scratch: *Scratch,
+    url: []const u8,
+    json_content: []const u8,
+    err: *const ParseJsonError,
+) noreturn {
+    reportJsonError(scratch, url, json_content, err);
+    std.process.exit(0xff);
 }
 
 fn reportJsonError(
@@ -1554,203 +1579,101 @@ fn reportJsonError(
 }
 
 /// Parse the "message" field from a JSON object like {"message":"Not Found",...}
-fn parseMessage(text: []const u8) ?[]const u8 {
-    const open = json.lex(text, 0);
-    if (open.tag != .@"{") return null;
-    var next_field = open.end;
-    while (true) {
-        const after_sep = blk: {
-            const token = json.lex(text, next_field);
-            if (token.tag == .@"}") break;
-            if (next_field != open.end) {
-                if (token.tag != .@",") return null;
-                break :blk token.end;
-            }
-            break :blk next_field;
-        };
-        const key_token = json.lex(text, after_sep);
-        if (key_token.tag != .string) return null;
-        const key = text[key_token.start + 1 .. key_token.end - 1];
-        const colon = json.lex(text, key_token.end);
-        if (colon.tag != .@":") return null;
-        if (std.mem.eql(u8, key, "message")) {
-            const val = json.lex(text, colon.end);
-            if (val.tag != .string) return null;
-            return text[val.start + 1 .. val.end - 1];
-        }
-        next_field = json.skipValue(text, colon.end) orelse return null;
-    }
-    return null;
+fn parseMessage(text: []const u8, err: *ParseJsonError) error{InvalidJson}![]const u8 {
+    var json_error: json.ParseError = undefined;
+    return parseMessageInner(text, &json_error) catch |e| switch (e) {
+        error.InvalidJson => return err.fromJson(json_error),
+        error.MissingField => return err.set(0, .{ .missing_field = "message" }),
+    };
 }
-
-const ParseLatestTagResult = union(enum) {
-    ok: []const u8,
-    empty,
-    err: ParseJsonError,
-    pub fn unexpected(got: json.Token, expected: [:0]const u8) ParseLatestTagResult {
-        return .{ .err = .{ .at = got.start, .why = .{ .unexpected_token = .{ .expected = expected, .got = got.tag } } } };
+fn parseMessageInner(text: []const u8, err: *json.ParseError) error{ InvalidJson, MissingField }![]const u8 {
+    var it = try json.ObjectIterator.init(text, 0, err);
+    while (try it.next(err)) |key| {
+        if (std.mem.eql(u8, key, "message"))
+            return (try it.takeString(err)).slice(text);
+        try it.skip(err);
     }
-};
+    return error.MissingField;
+}
 
 /// Parse the "name" field from the first element of a JSON array: [{"name":"tag",...},...]
-fn parseLatestTag(text: []const u8) ParseLatestTagResult {
+/// Returns null if the array is empty (there are no tags).
+fn parseLatestTag(text: []const u8, err: *ParseJsonError) error{InvalidJson}!?[]const u8 {
+    var json_error: json.ParseError = undefined;
+    return parseLatestTagInner(text, &json_error) catch |e| switch (e) {
+        error.MissingField => return err.set(0, .{ .missing_field = "name" }),
+        error.InvalidJson => return err.fromJson(json_error),
+    };
+}
+fn parseLatestTagInner(text: []const u8, err: *json.ParseError) error{ InvalidJson, MissingField }!?[]const u8 {
     const open = json.lex(text, 0);
-    if (open.tag != .@"[") return .unexpected(open, "\"[\"");
-
-    // Check for empty array.
+    if (open.tag != .@"[")
+        return err.set(open.start, .{ .unexpected_token = .{ .expected = "\"[\"", .got = open.tag } });
     const first = json.lex(text, open.end);
-    if (first.tag == .@"]") return .empty;
-
-    // Expect first element to be an object.
-    if (first.tag != .@"{") return .unexpected(first, "\"{\"");
-
-    var next_field = first.end;
-    while (true) {
-        const after_sep = blk: {
-            const token = json.lex(text, next_field);
-            if (token.tag == .@"}") break;
-            if (next_field != first.end) {
-                if (token.tag != .@",") return .unexpected(token, "\",\" or \"}\"");
-                break :blk token.end;
-            }
-            break :blk next_field;
-        };
-
-        const key_token = json.lex(text, after_sep);
-        if (key_token.tag != .string) return .unexpected(key_token, "field key string");
-        const key = text[key_token.start + 1 .. key_token.end - 1];
-
-        const colon_end = blk: {
-            const colon = json.lex(text, key_token.end);
-            if (colon.tag != .@":") return .unexpected(colon, "\":\"");
-            break :blk colon.end;
-        };
-
+    if (first.tag == .@"]") return null;
+    if (first.tag != .@"{")
+        return err.set(first.start, .{ .unexpected_token = .{ .expected = "\"{\"", .got = first.tag } });
+    var it = json.ObjectIterator.initOpened(text, first.end);
+    while (try it.next(err)) |key| {
         if (std.mem.eql(u8, key, "name")) {
-            const val = json.lex(text, colon_end);
-            if (val.tag != .string) return .unexpected(val, "string value");
-            return .{ .ok = text[val.start + 1 .. val.end - 1] };
+            const loc = try it.takeString(err);
+            return text[loc.start..loc.limit];
         }
-        next_field = json.skipValue(text, colon_end) orelse return .{ .err = .{ .at = colon_end, .why = .invalid_value } };
+        try it.skip(err);
     }
-
-    return .{ .err = .{ .at = 0, .why = .{ .missing_field = "name" } } };
+    return error.MissingField;
 }
 
-const ParseResult = union(enum) {
-    ok: Release,
-    err: ParseJsonError,
-    pub fn unexpected(got: json.Token, expected: [:0]const u8) ParseResult {
-        return .{ .err = .{ .at = got.start, .why = .{ .unexpected_token = .{ .expected = expected, .got = got.tag } } } };
-    }
-};
-fn parseRelease(text: []const u8) ParseResult {
-    const open_end = blk: {
-        const open = json.lex(text, 0);
-        if (open.tag != .@"{") return .{ .err = .{ .at = open.start, .why = .{ .unexpected_token = .{ .expected = "\"{\"", .got = open.tag } } } };
-        break :blk open.end;
+fn parseRelease(text: []const u8, err: *ParseJsonError) error{InvalidJson}!Release {
+    var json_error: json.ParseError = undefined;
+    return parseReleaseInner(text, &json_error) catch |e| switch (e) {
+        error.InvalidJson => return err.fromJson(json_error),
+        error.MissingFieldTagName => return err.set(0, .{ .missing_field = "tag_name" }),
+        error.MissingFieldTarballUrl => return err.set(0, .{ .missing_field = "tarball_url" }),
     };
-
-    var tag_name: ?[]const u8 = null;
-    var tarball_url: ?[]const u8 = null;
-
-    var next_field = open_end;
-    while (true) {
-        const after_sep = blk: {
-            const token = json.lex(text, next_field);
-            if (token.tag == .@"}") break;
-            if (next_field != open_end) {
-                if (token.tag != .@",") return .unexpected(token, "\",\" or \"}\"");
-                break :blk token.end;
-            }
-            break :blk next_field;
-        };
-
-        const key_token = json.lex(text, after_sep);
-        if (key_token.tag != .string) return .unexpected(key_token, "field key string");
-        const key = text[key_token.start + 1 .. key_token.end - 1];
-
-        const colon_end = blk: {
-            const colon = json.lex(text, key_token.end);
-            if (colon.tag != .@":") return .unexpected(colon, "\":\"");
-            break :blk colon.end;
-        };
-
-        const target = if (std.mem.eql(u8, key, "tag_name"))
-            &tag_name
-        else if (std.mem.eql(u8, key, "tarball_url"))
-            &tarball_url
-        else
-            null;
-
-        if (target) |t| {
-            const val = json.lex(text, colon_end);
-            if (val.tag != .string) return .unexpected(val, "string value");
-            t.* = text[val.start + 1 .. val.end - 1];
-            next_field = val.end;
-        } else {
-            next_field = json.skipValue(text, colon_end) orelse return .{ .err = .{ .at = colon_end, .why = .invalid_value } };
-        }
+}
+fn parseReleaseInner(text: []const u8, err: *json.ParseError) error{
+    InvalidJson,
+    MissingFieldTagName,
+    MissingFieldTarballUrl,
+}!Release {
+    var it = try json.ObjectIterator.init(text, 0, err);
+    var tag_name: ?json.Loc = null;
+    var tarball_url: ?json.Loc = null;
+    while (try it.next(err)) |key| {
+        if (std.mem.eql(u8, key, "tag_name")) {
+            tag_name = try it.takeString(err);
+        } else if (std.mem.eql(u8, key, "tarball_url")) {
+            tarball_url = try it.takeString(err);
+        } else try it.skip(err);
     }
-
-    return .{ .ok = .{
-        .tag_name = tag_name orelse return .{ .err = .{ .at = 0, .why = .{ .missing_field = "tag_name" } } },
-        .tarball_url = tarball_url orelse return .{ .err = .{ .at = 0, .why = .{ .missing_field = "tarball_url" } } },
-    } };
+    return .{
+        .tag_name = (tag_name orelse return error.MissingFieldTagName).slice(text),
+        .tarball_url = (tarball_url orelse return error.MissingFieldTarballUrl).slice(text),
+    };
 }
 
-const ParseCommitShaResult = union(enum) {
-    ok: GitSha,
-    err: ParseJsonError,
-    pub fn unexpected(got: json.Token, expected: [:0]const u8) ParseCommitShaResult {
-        return .{ .err = .{ .at = got.start, .why = .{ .unexpected_token = .{ .expected = expected, .got = got.tag } } } };
-    }
-};
-
-fn parseCommitSha(text: []const u8) ParseCommitShaResult {
-    const open_end = blk: {
-        const open = json.lex(text, 0);
-        if (open.tag != .@"{") return .{ .err = .{ .at = open.start, .why = .{ .unexpected_token = .{ .expected = "\"{\"", .got = open.tag } } } };
-        break :blk open.end;
+fn parseCommitSha(text: []const u8, err: *ParseJsonError) error{InvalidJson}!GitSha {
+    var json_error: json.ParseError = undefined;
+    const sha_loc = parseCommitShaInner(text, &json_error) catch |e| switch (e) {
+        error.InvalidJson => return err.fromJson(json_error),
+        error.MissingField => return err.set(0, .{ .missing_field = "sha" }),
     };
-
-    var sha: ?GitSha = null;
-
-    var next_field = open_end;
-    while (true) {
-        const after_sep = blk: {
-            const token = json.lex(text, next_field);
-            if (token.tag == .@"}") break;
-            if (next_field != open_end) {
-                if (token.tag != .@",") return .unexpected(token, "\",\" or \"}\"");
-                break :blk token.end;
-            }
-            break :blk next_field;
-        };
-
-        const key_token = json.lex(text, after_sep);
-        if (key_token.tag != .string) return .unexpected(key_token, "field key string");
-        const key = text[key_token.start + 1 .. key_token.end - 1];
-
-        const colon_end = blk: {
-            const colon = json.lex(text, key_token.end);
-            if (colon.tag != .@":") return .unexpected(colon, "\":\"");
-            break :blk colon.end;
-        };
-
-        if (std.mem.eql(u8, key, "sha")) {
-            const val = json.lex(text, colon_end);
-            if (val.tag != .string) return .unexpected(val, "string value");
-            const hex = text[val.start + 1 .. val.end - 1];
-            if (hex.len != 40) return .{ .err = .{ .at = val.start, .why = .{ .invalid_git_sha = hex } } };
-            sha = GitSha.fromHex(hex[0..40]) orelse return .{ .err = .{ .at = val.start, .why = .{ .invalid_git_sha = hex } } };
-            next_field = val.end;
-        } else {
-            next_field = json.skipValue(text, colon_end) orelse return .{ .err = .{ .at = colon_end, .why = .invalid_value } };
-        }
+    if (sha_loc.len() == 40) {
+        if (GitSha.fromHex(text[sha_loc.start..][0..40])) |sha| return sha;
     }
-
-    return .{ .ok = sha orelse return .{ .err = .{ .at = 0, .why = .{ .missing_field = "sha" } } } };
+    return err.set(sha_loc.start, .{ .invalid_git_sha = sha_loc });
+}
+fn parseCommitShaInner(text: []const u8, err: *json.ParseError) error{ InvalidJson, MissingField }!json.Loc {
+    var it = try json.ObjectIterator.init(text, 0, err);
+    while (try it.next(err)) |key| {
+        if (!std.mem.eql(u8, key, "sha")) {
+            try it.skip(err);
+            continue;
+        }
+        return try it.takeString(err);
+    }
+    return error.MissingField;
 }
 
 fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8, pkg_cache_path: []const u8) error{Reported}!void {
