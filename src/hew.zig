@@ -251,9 +251,86 @@ fn installPkg(scratch: *Scratch, config: *const InstallConfig, pkg: Pkg) !void {
     const scratch_pos = scratch.position();
     defer scratch.restorePosition(scratch_pos);
     switch (pkg) {
-        .github => |p| try installPkgGithub(scratch, config, p),
+        .github => |p| try installPkgRepo(scratch, config, .github, p),
+        .gitlab => |p| try installPkgRepo(scratch, config, .gitlab, p),
         .path => |p| try installPkgPath(scratch, config, @panic("todo: manifest path"), p, .installed_from_path),
     }
+}
+
+const Host = enum { github, gitlab };
+
+const FmtProjectId = struct {
+    host: Host,
+    owner_repo: []const u8,
+    pub fn format(f: FmtProjectId, w: *std.Io.Writer) error{WriteFailed}!void {
+        switch (f.host) {
+            .github => try w.writeAll(f.owner_repo),
+            .gitlab => {
+                const slash = std.mem.indexOfScalar(u8, f.owner_repo, '/').?;
+                try w.print("{s}%2F{s}", .{ f.owner_repo[0..slash], f.owner_repo[slash + 1 ..] });
+            },
+        }
+    }
+};
+fn fmtProjectId(host: Host, owner_repo: []const u8) FmtProjectId {
+    return .{ .host = host, .owner_repo = owner_repo };
+}
+
+fn allocLatestReleaseUrl(allocator: std.mem.Allocator, host: Host, owner_repo: []const u8) []u8 {
+    return switch (host) {
+        .github => std.fmt.allocPrint(
+            allocator,
+            "https://api.github.com/repos/{s}/releases/latest",
+            .{owner_repo},
+        ),
+        .gitlab => std.fmt.allocPrint(
+            allocator,
+            "https://gitlab.com/api/v4/projects/{f}/releases/permalink/latest",
+            .{fmtProjectId(host, owner_repo)},
+        ),
+    } catch |e| oom(e);
+}
+fn allocLatestTagUrl(allocator: std.mem.Allocator, host: Host, owner_repo: []const u8) []u8 {
+    return switch (host) {
+        .github => std.fmt.allocPrint(
+            allocator,
+            "https://api.github.com/repos/{s}/tags?per_page=1",
+            .{owner_repo},
+        ),
+        .gitlab => std.fmt.allocPrint(
+            allocator,
+            "https://gitlab.com/api/v4/projects/{f}/repository/tags?per_page=1",
+            .{fmtProjectId(host, owner_repo)},
+        ),
+    } catch |e| oom(e);
+}
+fn allocHeadCommitUrl(allocator: std.mem.Allocator, host: Host, owner_repo: []const u8) []u8 {
+    return switch (host) {
+        .github => std.fmt.allocPrint(
+            allocator,
+            "https://api.github.com/repos/{s}/commits/HEAD",
+            .{owner_repo},
+        ),
+        .gitlab => std.fmt.allocPrint(
+            allocator,
+            "https://gitlab.com/api/v4/projects/{f}/repository/commits/HEAD",
+            .{fmtProjectId(host, owner_repo)},
+        ),
+    } catch |e| oom(e);
+}
+fn allocArchiveUrl(allocator: std.mem.Allocator, host: Host, owner_repo: []const u8, ref: []const u8) []u8 {
+    return switch (host) {
+        .github => std.fmt.allocPrint(
+            allocator,
+            "https://api.github.com/repos/{s}/tarball/{s}",
+            .{ owner_repo, ref },
+        ),
+        .gitlab => std.fmt.allocPrint(
+            allocator,
+            "https://gitlab.com/api/v4/projects/{f}/repository/archive.tar.gz?sha={s}",
+            .{ fmtProjectId(host, owner_repo), ref },
+        ),
+    } catch |e| oom(e);
 }
 
 const anyzig_version: *const [11]u8 = "v2025_10_15";
@@ -445,7 +522,7 @@ fn ensureAnyzig(
         return reportError("delete '{s}' failed with {t}", .{ pkg_cache_path, err });
 }
 
-const GithubArchive = union(enum) {
+const RepoArchive = union(enum) {
     rev: struct {
         json: std.ArrayListUnmanaged(u8),
         rev_name: []const u8,
@@ -456,7 +533,7 @@ const GithubArchive = union(enum) {
         sha: GitSha,
         tarball_url: []const u8,
     },
-    pub fn deinit(archive: *GithubArchive, allocator: std.mem.Allocator) void {
+    pub fn deinit(archive: *RepoArchive, allocator: std.mem.Allocator) void {
         switch (archive.*) {
             .rev => |*r| r.json.deinit(allocator),
             .tip => |*t| {
@@ -467,23 +544,23 @@ const GithubArchive = union(enum) {
         archive.* = undefined;
     }
 
-    pub fn url(archive: *const GithubArchive) []const u8 {
+    pub fn url(archive: *const RepoArchive) []const u8 {
         return switch (archive.*) {
             .rev => |*r| r.tarball_url,
             .tip => |*t| t.tarball_url,
         };
     }
-    pub fn allocRevision(archive: *const GithubArchive, allocator: std.mem.Allocator) []u8 {
+    pub fn allocRevision(archive: *const RepoArchive, allocator: std.mem.Allocator) []u8 {
         return switch (archive.*) {
             .rev => |*r| allocator.dupe(u8, r.rev_name) catch |e| oom(e),
             .tip => |*t| std.fmt.allocPrint(allocator, "{f}", .{t.sha}) catch |e| oom(e),
         };
     }
-    pub fn fmtUniqueName(archive: *const GithubArchive) FmtUniqueName {
+    pub fn fmtUniqueName(archive: *const RepoArchive) FmtUniqueName {
         return FmtUniqueName{ .archive = archive };
     }
     const FmtUniqueName = struct {
-        archive: *const GithubArchive,
+        archive: *const RepoArchive,
         pub fn format(n: FmtUniqueName, w: *std.Io.Writer) error{WriteFailed}!void {
             switch (n.archive.*) {
                 .rev => |*r| try w.writeAll(r.rev_name),
@@ -493,32 +570,33 @@ const GithubArchive = union(enum) {
     };
 };
 
-fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: []const u8, client: *std.http.Client) GithubArchive {
-    log.info("fetching tip commit for github:{s}...", .{owner_repo});
-    const commit_url = std.fmt.allocPrint(
-        scratch.allocator(),
-        "https://api.github.com/repos/{s}/commits/HEAD",
-        .{owner_repo},
-    ) catch |e| oom(e);
+fn parseHeadCommitSha(host: Host, text: []const u8) ParseCommitShaResult {
+    return switch (host) {
+        .github => parseCommitSha(text, "sha"),
+        .gitlab => parseCommitSha(text, "id"),
+    };
+}
+
+fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, host: Host, owner_repo: []const u8, client: *std.http.Client) RepoArchive {
+    log.info("fetching tip commit for {t}:{s}...", .{ host, owner_repo });
+    const commit_url = allocHeadCommitUrl(scratch.allocator(), host, owner_repo);
     defer scratch.allocator().free(commit_url);
     var timer = timerStart();
-    const commit_result = fetchGithubJson(commit_url, client, allocator);
+    const commit_result = fetchJson(commit_url, client, allocator);
     if (commit_result.status != .ok)
         fetchErrExit(commit_url, commit_result);
     const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
     log.info("fetched tip commit JSON in {d:.2} seconds", .{elapsed});
-    const sha = switch (parseCommitSha(commit_result.body.items)) {
+    const sha = switch (parseHeadCommitSha(host, commit_result.body.items)) {
         .ok => |sha| sha,
         .err => |*err| {
             reportJsonError(scratch, commit_url, commit_result.body.items, err);
             std.process.exit(0xff);
         },
     };
-    const tarball_url = std.fmt.allocPrint(
-        allocator,
-        "https://api.github.com/repos/{s}/tarball/{f}",
-        .{ owner_repo, &sha },
-    ) catch |e| oom(e);
+    var sha_buf: [40]u8 = undefined;
+    const sha_hex = std.fmt.bufPrint(&sha_buf, "{f}", .{&sha}) catch unreachable;
+    const tarball_url = allocArchiveUrl(allocator, host, owner_repo, sha_hex);
     errdefer allocator.free(tarball_url);
     return .{ .tip = .{
         .json = commit_result.body,
@@ -527,59 +605,71 @@ fn fetchTip(scratch: *Scratch, allocator: std.mem.Allocator, owner_repo: []const
     } };
 }
 
-fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGithub) !void {
+fn installPkgRepo(scratch: *Scratch, config: *const InstallConfig, host: Host, pkg: PkgRepo) !void {
     const scratch_pos = scratch.position();
     defer scratch.restorePosition(scratch_pos);
     var client: std.http.Client = .{ .allocator = scratch.allocator() };
     defer client.deinit();
 
-    var archive: GithubArchive = blk: switch (pkg.commit) {
+    var archive: RepoArchive = blk: switch (pkg.commit) {
         .latest_release => {
-            log.info("fetching latest release for github:{s}...", .{pkg.owner_repo});
-            const release_url = std.fmt.allocPrint(
-                scratch.allocator(),
-                "https://api.github.com/repos/{s}/releases/latest",
-                .{pkg.owner_repo},
-            ) catch |e| oom(e);
+            log.info("fetching latest release for {t}:{s}...", .{ host, pkg.owner_repo });
+            const release_url = allocLatestReleaseUrl(scratch.allocator(), host, pkg.owner_repo);
             defer scratch.allocator().free(release_url);
             var timer = timerStart();
-            var fetch_result = fetchGithubJson(release_url, &client, scratch.allocator());
+            var fetch_result = fetchJson(release_url, &client, scratch.allocator());
             errdefer fetch_result.body.deinit(scratch.allocator());
             if (fetch_result.status == .ok) {
                 const elapsed: f64 = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
                 log.info("fetched latest release JSON in {d:.2} seconds", .{elapsed});
-                const release = switch (parseRelease(fetch_result.body.items)) {
-                    .ok => |release| release,
-                    .err => |*err| {
-                        reportJsonError(scratch, release_url, fetch_result.body.items, err);
-                        std.process.exit(0xff);
+                const tag_name: []const u8, const tarball_url: []const u8 = switch (host) {
+                    .github => sw: {
+                        const release = switch (parseRelease(fetch_result.body.items)) {
+                            .ok => |r| r,
+                            .err => |*err| {
+                                reportJsonError(scratch, release_url, fetch_result.body.items, err);
+                                std.process.exit(0xff);
+                            },
+                        };
+                        break :sw .{ release.tag_name, release.tarball_url };
+                    },
+                    .gitlab => sw: {
+                        const tag = switch (parseTagName(fetch_result.body.items)) {
+                            .ok => |t| t,
+                            .err => |*err| {
+                                reportJsonError(scratch, release_url, fetch_result.body.items, err);
+                                std.process.exit(0xff);
+                            },
+                        };
+                        const url = allocArchiveUrl(scratch.allocator(), host, pkg.owner_repo, tag);
+                        break :sw .{ tag, url };
                     },
                 };
-                log.info("latest release is tag {s}", .{release.tag_name});
+                log.info("latest release is tag {s}", .{tag_name});
                 break :blk .{ .rev = .{
                     .json = fetch_result.body,
-                    .rev_name = release.tag_name,
-                    .tarball_url = release.tarball_url,
+                    .rev_name = tag_name,
+                    .tarball_url = tarball_url,
                 } };
             }
             // Only fall back to tags if the releases endpoint returned "Not Found".
             // Other 404s (e.g. repo doesn't exist) should still be fatal.
+            const not_found_msg: []const u8 = switch (host) {
+                .github => "Not Found",
+                .gitlab => "404 Not Found",
+            };
             const is_no_releases = fetch_result.status == .not_found and
-                if (parseMessage(fetch_result.body.items)) |msg| std.mem.eql(u8, msg, "Not Found") else false;
+                if (parseMessage(fetch_result.body.items)) |msg| std.mem.eql(u8, msg, not_found_msg) else false;
             if (!is_no_releases)
                 fetchErrExit(release_url, fetch_result);
             fetch_result.body.deinit(scratch.allocator());
 
             // No releases found, fall back to latest tag.
-            log.info("no releases found, fetching latest tag for github:{s}...", .{pkg.owner_repo});
-            const tags_url = std.fmt.allocPrint(
-                scratch.allocator(),
-                "https://api.github.com/repos/{s}/tags?per_page=1",
-                .{pkg.owner_repo},
-            ) catch |e| oom(e);
+            log.info("no releases found, fetching latest tag for {t}:{s}...", .{ host, pkg.owner_repo });
+            const tags_url = allocLatestTagUrl(scratch.allocator(), host, pkg.owner_repo);
             defer scratch.allocator().free(tags_url);
             timer = timerStart();
-            var tags_result = fetchGithubJson(tags_url, &client, scratch.allocator());
+            var tags_result = fetchJson(tags_url, &client, scratch.allocator());
             errdefer tags_result.body.deinit(scratch.allocator());
             if (tags_result.status != .ok)
                 fetchErrExit(tags_url, tags_result);
@@ -588,9 +678,9 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
             const tag_name = switch (parseLatestTag(tags_result.body.items)) {
                 .ok => |name| name,
                 .empty => {
-                    log.info("no tags found either, falling back to tip for github:{s}...", .{pkg.owner_repo});
+                    log.info("no tags found either, falling back to tip for {t}:{s}...", .{ host, pkg.owner_repo });
                     tags_result.body.deinit(scratch.allocator());
-                    const tip_archive = fetchTip(scratch, scratch.allocator(), pkg.owner_repo, &client);
+                    const tip_archive = fetchTip(scratch, scratch.allocator(), host, pkg.owner_repo, &client);
                     log.info("tip is commit {f}", .{&tip_archive.tip.sha});
                     break :blk tip_archive;
                 },
@@ -600,11 +690,7 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
                 },
             };
             log.info("latest tag is {s}", .{tag_name});
-            const tarball_url = std.fmt.allocPrint(
-                scratch.allocator(),
-                "https://api.github.com/repos/{s}/tarball/{s}",
-                .{ pkg.owner_repo, tag_name },
-            ) catch |e| oom(e);
+            const tarball_url = allocArchiveUrl(scratch.allocator(), host, pkg.owner_repo, tag_name);
             break :blk .{ .rev = .{
                 .json = tags_result.body,
                 .rev_name = tag_name,
@@ -612,11 +698,7 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
             } };
         },
         .rev => |rev| {
-            const tarball_url = std.fmt.allocPrint(
-                scratch.allocator(),
-                "https://api.github.com/repos/{s}/tarball/{s}",
-                .{ pkg.owner_repo, rev },
-            ) catch |e| oom(e);
+            const tarball_url = allocArchiveUrl(scratch.allocator(), host, pkg.owner_repo, rev);
             errdefer scratch.allocator().free(tarball_url);
             break :blk .{ .rev = .{
                 .json = .{},
@@ -624,14 +706,14 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
                 .tarball_url = tarball_url,
             } };
         },
-        .tip => break :blk fetchTip(scratch, scratch.allocator(), pkg.owner_repo, &client),
+        .tip => break :blk fetchTip(scratch, scratch.allocator(), host, pkg.owner_repo, &client),
     };
     defer archive.deinit(scratch.allocator());
 
     const manifest_path = std.fmt.allocPrint(
         scratch.allocator(),
-        "{s}{c}manifests{1c}github-{s}-{s}-{f}",
-        .{ config.app_data_path, std.fs.path.sep, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
+        "{s}{c}manifests{1c}{t}-{s}-{s}-{f}",
+        .{ config.app_data_path, std.fs.path.sep, host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
     ) catch |e| oom(e);
     defer scratch.allocator().free(manifest_path);
     if (std.fs.cwd().readFileAlloc(scratch.allocator(), manifest_path, std.math.maxInt(usize))) |manifest| {
@@ -647,7 +729,7 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
             }
         }
         if (installed) {
-            std.log.info("{f}: already installed", .{pkg});
+            std.log.info("{t}:{s}: already installed", .{ host, pkg.owner_repo });
             return;
         }
     } else |err| switch (err) {
@@ -657,8 +739,8 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
 
     const pkg_cache_path = std.fmt.allocPrint(
         scratch.allocator(),
-        "{s}{c}github-{s}-{s}-{f}.tar.gz",
-        .{ config.cache_path, std.fs.path.sep, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
+        "{s}{c}{t}-{s}-{s}-{f}.tar.gz",
+        .{ config.cache_path, std.fs.path.sep, host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
     ) catch |e| oom(e);
     defer scratch.free(pkg_cache_path);
 
@@ -673,8 +755,8 @@ fn installPkgGithub(scratch: *Scratch, config: *const InstallConfig, pkg: PkgGit
 
     const extract_dir_path = allocTmpPath(
         scratch.allocator(),
-        "hew-github-{s}-{s}-{f}",
-        .{ pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
+        "hew-{t}-{s}-{s}-{f}",
+        .{ host, pkg.owner(), pkg.repo(), archive.fmtUniqueName() },
     );
     defer scratch.free(extract_dir_path);
 
@@ -1381,42 +1463,49 @@ const Release = struct {
 };
 
 const bearer_prefix = "Bearer ";
-const github_auth_buf_len = bearer_prefix.len + 256;
+const auth_buf_len = bearer_prefix.len + 256;
 
-fn isGithubUrl(url: []const u8) bool {
-    const uri = std.Uri.parse(url) catch return false;
-    const host = (uri.host orelse return false).percent_encoded;
-    return std.mem.eql(u8, host, "github.com") or
-        std.mem.endsWith(u8, host, ".github.com");
+fn hostFromUrl(url: []const u8) ?Host {
+    const uri = std.Uri.parse(url) catch return null;
+    const host = (uri.host orelse return null).percent_encoded;
+    if (std.mem.eql(u8, host, "github.com") or std.mem.endsWith(u8, host, ".github.com")) return .github;
+    if (std.mem.eql(u8, host, "gitlab.com") or std.mem.endsWith(u8, host, ".gitlab.com")) return .gitlab;
+    return null;
 }
 
 var github_auth_logged: std.atomic.Value(bool) = .init(false);
+var gitlab_auth_logged: std.atomic.Value(bool) = .init(false);
 
-fn githubAuthHeader(buf: *[github_auth_buf_len]u8, url: []const u8) std.http.Client.Request.Headers.Value {
-    if (!isGithubUrl(url)) return .default;
+const TokenFound = struct { len: usize, env_name: []const u8 };
+
+fn findTokenEnv(dest: []u8, comptime env_names: anytype) ?TokenFound {
+    inline for (env_names) |name| {
+        if (builtin.os.tag == .windows) {
+            const W = comptime std.unicode.utf8ToUtf16LeStringLiteral(name);
+            if (getEnvWindows(W, dest)) |len| return .{ .len = len, .env_name = name };
+        } else {
+            if (std.posix.getenv(name)) |token| {
+                if (token.len > dest.len) errExit("{s} too long", .{name});
+                @memcpy(dest[0..token.len], token);
+                return .{ .len = token.len, .env_name = name };
+            }
+        }
+    }
+    return null;
+}
+
+fn authHeader(buf: *[auth_buf_len]u8, url: []const u8) std.http.Client.Request.Headers.Value {
+    const host = hostFromUrl(url) orelse return .default;
     const dest = buf[bearer_prefix.len..];
-    const token_len, const env_name = if (builtin.os.tag == .windows) blk: {
-        if (getEnvWindows(L("GH_TOKEN"), dest)) |len| break :blk .{ len, "GH_TOKEN" };
-        if (getEnvWindows(L("GITHUB_TOKEN"), dest)) |len| break :blk .{ len, "GITHUB_TOKEN" };
-        break :blk .{ @as(usize, 0), @as([]const u8, "none") };
-    } else blk: {
-        if (std.posix.getenv("GH_TOKEN")) |token| {
-            if (token.len > dest.len) errExit("GH_TOKEN too long", .{});
-            @memcpy(dest[0..token.len], token);
-            break :blk .{ token.len, "GH_TOKEN" };
-        }
-        if (std.posix.getenv("GITHUB_TOKEN")) |token| {
-            if (token.len > dest.len) errExit("GITHUB_TOKEN too long", .{});
-            @memcpy(dest[0..token.len], token);
-            break :blk .{ token.len, "GITHUB_TOKEN" };
-        }
-        break :blk .{ @as(usize, 0), @as([]const u8, "none") };
+    const found, const logged = switch (host) {
+        .github => .{ findTokenEnv(dest, .{ "GH_TOKEN", "GITHUB_TOKEN" }), &github_auth_logged },
+        .gitlab => .{ findTokenEnv(dest, .{ "GITLAB_TOKEN", "GL_TOKEN" }), &gitlab_auth_logged },
     };
-    if (!github_auth_logged.swap(true, .monotonic))
-        log.info("github auth: {s}", .{env_name});
-    if (token_len == 0) return .default;
+    if (!logged.swap(true, .monotonic))
+        log.info("{t} auth: {s}", .{ host, if (found) |f| f.env_name else "none" });
+    const f = found orelse return .default;
     @memcpy(buf[0..bearer_prefix.len], bearer_prefix);
-    return .{ .override = buf[0 .. bearer_prefix.len + token_len] };
+    return .{ .override = buf[0 .. bearer_prefix.len + f.len] };
 }
 
 const FetchResult = struct {
@@ -1424,8 +1513,8 @@ const FetchResult = struct {
     body: std.ArrayListUnmanaged(u8),
 };
 
-fn fetchGithubJson(url: []const u8, client: *std.http.Client, allocator: std.mem.Allocator) FetchResult {
-    var github_auth_buf: [github_auth_buf_len]u8 = undefined;
+fn fetchJson(url: []const u8, client: *std.http.Client, allocator: std.mem.Allocator) FetchResult {
+    var auth_buf: [auth_buf_len]u8 = undefined;
 
     var attempt_counter: u8 = 0;
     while (true) : (attempt_counter += 1) {
@@ -1435,7 +1524,7 @@ fn fetchGithubJson(url: []const u8, client: *std.http.Client, allocator: std.mem
             .location = .{ .url = url },
             .headers = .{
                 .user_agent = .{ .override = "hew/0.0.1" },
-                .authorization = githubAuthHeader(&github_auth_buf, url),
+                .authorization = authHeader(&auth_buf, url),
             },
             .response_writer = &response_body.writer,
         }) catch |err| {
@@ -1707,7 +1796,7 @@ const ParseCommitShaResult = union(enum) {
     }
 };
 
-fn parseCommitSha(text: []const u8) ParseCommitShaResult {
+fn parseCommitSha(text: []const u8, comptime field_name: [:0]const u8) ParseCommitShaResult {
     const open_end = blk: {
         const open = json.lex(text, 0);
         if (open.tag != .@"{") return .{ .err = .{ .at = open.start, .why = .{ .unexpected_token = .{ .expected = "\"{\"", .got = open.tag } } } };
@@ -1738,7 +1827,7 @@ fn parseCommitSha(text: []const u8) ParseCommitShaResult {
             break :blk colon.end;
         };
 
-        if (std.mem.eql(u8, key, "sha")) {
+        if (std.mem.eql(u8, key, field_name)) {
             const val = json.lex(text, colon_end);
             if (val.tag != .string) return .unexpected(val, "string value");
             const hex = text[val.start + 1 .. val.end - 1];
@@ -1750,7 +1839,56 @@ fn parseCommitSha(text: []const u8) ParseCommitShaResult {
         }
     }
 
-    return .{ .ok = sha orelse return .{ .err = .{ .at = 0, .why = .{ .missing_field = "sha" } } } };
+    return .{ .ok = sha orelse return .{ .err = .{ .at = 0, .why = .{ .missing_field = field_name } } } };
+}
+
+const ParseTagNameResult = union(enum) {
+    ok: []const u8,
+    err: ParseJsonError,
+    pub fn unexpected(got: json.Token, expected: [:0]const u8) ParseTagNameResult {
+        return .{ .err = .{ .at = got.start, .why = .{ .unexpected_token = .{ .expected = expected, .got = got.tag } } } };
+    }
+};
+
+/// Parse the "tag_name" field from a single JSON object (used for GitLab's release endpoint).
+fn parseTagName(text: []const u8) ParseTagNameResult {
+    const open_end = blk: {
+        const open = json.lex(text, 0);
+        if (open.tag != .@"{") return .unexpected(open, "\"{\"");
+        break :blk open.end;
+    };
+
+    var next_field = open_end;
+    while (true) {
+        const after_sep = blk: {
+            const token = json.lex(text, next_field);
+            if (token.tag == .@"}") break;
+            if (next_field != open_end) {
+                if (token.tag != .@",") return .unexpected(token, "\",\" or \"}\"");
+                break :blk token.end;
+            }
+            break :blk next_field;
+        };
+
+        const key_token = json.lex(text, after_sep);
+        if (key_token.tag != .string) return .unexpected(key_token, "field key string");
+        const key = text[key_token.start + 1 .. key_token.end - 1];
+
+        const colon_end = blk: {
+            const colon = json.lex(text, key_token.end);
+            if (colon.tag != .@":") return .unexpected(colon, "\":\"");
+            break :blk colon.end;
+        };
+
+        if (std.mem.eql(u8, key, "tag_name")) {
+            const val = json.lex(text, colon_end);
+            if (val.tag != .string) return .unexpected(val, "string value");
+            return .{ .ok = text[val.start + 1 .. val.end - 1] };
+        }
+        next_field = json.skipValue(text, colon_end) orelse return .{ .err = .{ .at = colon_end, .why = .invalid_value } };
+    }
+
+    return .{ .err = .{ .at = 0, .why = .{ .missing_field = "tag_name" } } };
 }
 
 fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8, pkg_cache_path: []const u8) error{Reported}!void {
@@ -1794,12 +1932,12 @@ fn downloadToCache(scratch: *Scratch, client: *std.http.Client, url: []const u8,
             defer download_file.close();
             var download_buf: [4096]u8 = undefined;
             var file_writer = download_file.writer(&download_buf);
-            var auth_buf: [github_auth_buf_len]u8 = undefined;
+            var auth_buf: [auth_buf_len]u8 = undefined;
             const result = client.fetch(.{
                 .location = .{ .url = url },
                 .headers = .{
                     .user_agent = .{ .override = "hew/0.0.1" },
-                    .authorization = githubAuthHeader(&auth_buf, url),
+                    .authorization = authHeader(&auth_buf, url),
                 },
                 .response_writer = &file_writer.interface,
             }) catch |err| switch (err) {
@@ -2252,5 +2390,5 @@ const GitSha = @import("GitSha.zig");
 const LockFile = @import("LockFile.zig");
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 const Pkg = @import("pkg.zig").Pkg;
-const PkgGithub = @import("pkg.zig").PkgGithub;
+const PkgRepo = @import("pkg.zig").PkgRepo;
 const Sha256 = std.crypto.hash.sha2.Sha256;

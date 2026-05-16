@@ -138,7 +138,7 @@ const FmtTestName = struct {
     pkg: Pkg,
     pub fn format(f: FmtTestName, w: *std.Io.Writer) error{WriteFailed}!void {
         switch (f.pkg) {
-            .github => |gh| try w.writeAll(gh.repo()),
+            .github, .gitlab => |r| try w.writeAll(r.repo()),
             .path => @panic("path packages not supported"),
         }
     }
